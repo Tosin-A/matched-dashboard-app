@@ -82,9 +82,37 @@ type Selection = {
 
 type FilterMode = 'auto' | 'qualifying' | 'free_bet' | 'custom'
 type ScanMode   = 'all' | 'single'
+type Timeframe  = 'any' | '3h' | 'today' | 'tomorrow' | '7d'
+
+function getDateRange(timeframe: Timeframe): { min?: string; max?: string } {
+  const now = new Date()
+  if (timeframe === '3h') {
+    return { min: now.toISOString(), max: new Date(now.getTime() + 3 * 60 * 60 * 1000).toISOString() }
+  }
+  if (timeframe === 'today') {
+    const max = new Date(now); max.setHours(23, 59, 59, 999)
+    return { min: now.toISOString(), max: max.toISOString() }
+  }
+  if (timeframe === 'tomorrow') {
+    const min = new Date(now); min.setDate(min.getDate() + 1); min.setHours(0, 0, 0, 0)
+    const max = new Date(min); max.setHours(23, 59, 59, 999)
+    return { min: min.toISOString(), max: max.toISOString() }
+  }
+  if (timeframe === '7d') {
+    return { min: now.toISOString(), max: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString() }
+  }
+  return {}
+}
 type SmarketsCredentials = { username: string; password: string }
-type LoginStatus = 'idle' | 'checking' | 'valid' | 'invalid'
+type LoginStatus = 'idle' | 'checking' | 'valid' | 'limited' | 'invalid'
 type AccountResponse = { account?: { account_id?: string; currency?: string } }
+
+function getLimitedModeReason(message: string): string | null {
+  if (message.includes('PASSWORD_RESET_NEEDED')) return 'PASSWORD_RESET_NEEDED'
+  if (message.includes('IP_NOT_TRUSTED')) return 'IP_NOT_TRUSTED'
+  if (message.includes('INSUFFICIENT_PERMISSIONS')) return 'INSUFFICIENT_PERMISSIONS'
+  return null
+}
 
 const BOOKMAKERS = [
   'Bet365', 'Unibet', 'William Hill', 'Betway',
@@ -114,20 +142,34 @@ function bookmakerUrl(bookmaker: string, eventName: string): string {
   return `https://www.${slug}.com/search?q=${q}`
 }
 
-async function apiGet(path: string, creds: SmarketsCredentials, params?: Record<string, string>, accountId?: string) {
-  const qs = new URLSearchParams({ path, ...params })
-  const url = `/api/smarkets?${qs}`
+async function apiGet(
+  path: string,
+  creds: SmarketsCredentials,
+  params?: Record<string, string>,
+  accountId?: string,
+  options?: { allowPublicFallback?: boolean; preferPublic?: boolean }
+) {
   const maxAttempts = 3
   let lastError = 'Unknown API error'
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const res = await fetch(url, {
+    const res = await fetch('/api/smarkets', {
+      method: 'POST',
       cache: 'no-store',
       headers: {
-        'x-smarkets-username': creds.username,
-        'x-smarkets-password': creds.password,
-        ...(accountId ? { 'x-smarkets-account-id': accountId } : {}),
+        'Content-Type': 'application/json',
       },
+      body: JSON.stringify({
+        path,
+        params: params ?? {},
+        credentials: {
+          username: creds.username,
+          password: creds.password,
+        },
+        accountId: accountId ?? undefined,
+        allowPublicFallback: Boolean(options?.allowPublicFallback),
+        preferPublic: Boolean(options?.preferPublic),
+      }),
     })
     const bodyText = await res.text()
     let json: Record<string, unknown> = {}
@@ -182,14 +224,21 @@ async function scanSport(
   sportId: string,
   creds: SmarketsCredentials,
   query?: string,
-  accountId?: string
+  accountId?: string,
+  preferPublic = false,
+  dateRange?: { min?: string; max?: string }
 ): Promise<Selection[]> {
   const evParams: Record<string, string> = {
     type: sportType, state: 'upcoming', sort: 'start_datetime,id', limit: '15',
   }
   if (query?.trim()) evParams.name = query.trim()
+  if (dateRange?.min) evParams.start_datetime_min = dateRange.min
+  if (dateRange?.max) evParams.start_datetime_max = dateRange.max
 
-  const evData = await apiGet('/events/', creds, evParams, accountId)
+  const evData = await apiGet('/events/', creds, evParams, accountId, {
+    allowPublicFallback: true,
+    preferPublic,
+  })
   const eventList = evData.events
   const events: Array<{ id: string; name: string; start_datetime: string }> = Array.isArray(eventList)
     ? (eventList as Array<{ id: string; name: string; start_datetime: string }>)
@@ -200,7 +249,11 @@ async function scanSport(
   const marketResults = await mapWithConcurrency(
     targetEvents,
     3,
-    ev => apiGet(`/events/${ev.id}/markets/`, creds, undefined, accountId)
+    ev =>
+      apiGet(`/events/${ev.id}/markets/`, creds, undefined, accountId, {
+        allowPublicFallback: true,
+        preferPublic,
+      })
   )
 
   type EM = { event: typeof targetEvents[number]; market: { id: string; name: string } }
@@ -223,8 +276,14 @@ async function scanSport(
     3,
     async ({ event, market }) => {
       const [ctData, qtData] = await Promise.all([
-        apiGet(`/markets/${market.id}/contracts/`, creds, undefined, accountId),
-        apiGet(`/markets/${market.id}/quotes/`, creds, undefined, accountId),
+        apiGet(`/markets/${market.id}/contracts/`, creds, undefined, accountId, {
+          allowPublicFallback: true,
+          preferPublic,
+        }),
+        apiGet(`/markets/${market.id}/quotes/`, creds, undefined, accountId, {
+          allowPublicFallback: true,
+          preferPublic,
+        }),
       ])
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return { event, market, contracts: (ctData.contracts as any[]) || [], quotes: qtData }
@@ -271,6 +330,9 @@ type OnUse = (prefill: { backOdds: string; layOdds: string; label: string }) => 
 export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
   const isMobile = useIsMobile()
   const [loginExpanded, setLoginExpanded] = useState(true)
+  const [useSmarketsApi, setUseSmarketsApi] = useState(() => (
+    typeof window === 'undefined' ? true : localStorage.getItem('matchlock_use_smarkets_api') !== 'false'
+  ))
   const [scanMode, setScanMode]       = useState<ScanMode>('all')
   const [selectedSport, setSelectedSport] = useState('football')
   const [bookmaker, setBookmaker]     = useState('Bet365')
@@ -280,11 +342,13 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
   const [smarketsPassword, setSmarketsPassword] = useState(() => (
     typeof window === 'undefined' ? '' : localStorage.getItem('matchlock_smarkets_password') || ''
   ))
+  const [showPassword, setShowPassword] = useState(false)
   const [loginStatus, setLoginStatus] = useState<LoginStatus>('idle')
   const [loginStatusMessage, setLoginStatusMessage] = useState('')
   const [loginVerifiedAt, setLoginVerifiedAt] = useState<string | null>(null)
   const [verifiedAccountId, setVerifiedAccountId] = useState<string | null>(null)
   const [verifiedAccountCurrency, setVerifiedAccountCurrency] = useState<string | null>(null)
+  const [timeframe, setTimeframe]     = useState<Timeframe>('any')
   const [query, setQuery]             = useState('')
   const [loading, setLoading]         = useState(false)
   const [progress, setProgress]       = useState<string[]>([])
@@ -295,15 +359,22 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
   const [filterMode, setFilterMode]   = useState<FilterMode>('auto')
   const [customMin, setCustomMin]     = useState('1.01')
   const [customMax, setCustomMax]     = useState('10.0')
+  const [manualBackOdds, setManualBackOdds] = useState('')
+  const [manualLayOdds, setManualLayOdds] = useState('')
+  const [manualLabel, setManualLabel] = useState('')
 
   const scan = useCallback(async () => {
+    if (!useSmarketsApi) {
+      setError('Smarkets API is turned off. Use manual odds entry below.')
+      return
+    }
     const email = smarketsEmail.trim()
-    const password = smarketsPassword.trim()
-    if (!email || !password) {
+    const password = smarketsPassword
+    if (!email || password.length === 0) {
       setError('Enter your own Smarkets email and password before scanning.')
       return
     }
-    if (loginStatus !== 'valid' || !verifiedAccountId) {
+    if (loginStatus !== 'valid' && loginStatus !== 'limited') {
       setError('Verify your Smarkets login before scanning.')
       return
     }
@@ -313,6 +384,9 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
     setResults([])
     setProgress([])
     const creds: SmarketsCredentials = { username: email, password }
+    const preferPublic = loginStatus === 'limited'
+
+    const dateRange = getDateRange(timeframe)
 
     try {
       if (scanMode === 'all') {
@@ -322,7 +396,7 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
 
         const sportResults = await Promise.all(
           sportList.map(async (s, idx) => {
-            const sels = await scanSport(s.type, s.id, creds, query, verifiedAccountId ?? undefined)
+            const sels = await scanSport(s.type, s.id, creds, query, verifiedAccountId ?? undefined, preferPublic, dateRange)
             setProgress(prev => {
               const next = [...prev]
               next[idx] = `${s.label} — ${sels.length} found`
@@ -333,14 +407,8 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
         )
 
         const all = sportResults.flat()
-        // Sort free bets (≥5) by highest back odds; rest by tightest spread
-        all.sort((a, b) => {
-          const aFb = a.backOdds >= 5.0
-          const bFb = b.backOdds >= 5.0
-          if (aFb && bFb) return b.backOdds - a.backOdds
-          if (!aFb && !bFb) return a.spread - b.spread
-          return 0
-        })
+        // Sort by efficiency (backOdds / layOdds) descending — highest profit / smallest loss first
+        all.sort((a, b) => (b.backOdds / b.layOdds) - (a.backOdds / a.layOdds))
         setResults(all)
         setLastUpdatedAt(new Date().toISOString())
         if (all.length === 0) setError('No live quotes found across any sport. Markets may not be open yet.')
@@ -348,8 +416,9 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
         // Single sport
         const s = SPORTS.find(sp => sp.id === selectedSport)!
         setProgress([`Scanning ${s.label}…`])
-        const sels = await scanSport(s.type, s.id, creds, query, verifiedAccountId ?? undefined)
-        sels.sort((a, b) => a.spread - b.spread)
+        const sels = await scanSport(s.type, s.id, creds, query, verifiedAccountId ?? undefined, preferPublic, dateRange)
+        // Sort by efficiency descending — highest profit / smallest loss first
+        sels.sort((a, b) => (b.backOdds / b.layOdds) - (a.backOdds / a.layOdds))
         setResults(sels)
         setLastUpdatedAt(new Date().toISOString())
         if (sels.length === 0) setError('No valid quotes right now. Try again in a moment.')
@@ -361,12 +430,12 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
       setLoading(false)
       if (scanMode === 'all') setTimeout(() => setProgress([]), 2000)
     }
-  }, [scanMode, selectedSport, query, smarketsEmail, smarketsPassword, loginStatus, verifiedAccountId])
+  }, [scanMode, selectedSport, query, timeframe, smarketsEmail, smarketsPassword, loginStatus, verifiedAccountId, useSmarketsApi])
 
   const handleVerifyAndSaveCredentials = async () => {
     const email = smarketsEmail.trim()
-    const password = smarketsPassword.trim()
-    if (!email || !password) {
+    const password = smarketsPassword
+    if (!email || password.length === 0) {
       setError('Both Smarkets email and password are required.')
       setLoginStatus('invalid')
       setLoginStatusMessage('Enter both email and password.')
@@ -399,6 +468,21 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
       setTimeout(() => setLoginExpanded(false), 800)
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
+      const limitedReason = getLimitedModeReason(detail)
+      if (limitedReason) {
+        localStorage.setItem('matchlock_smarkets_email', email)
+        localStorage.setItem('matchlock_smarkets_password', password)
+        setLoginStatus('limited')
+        setLoginStatusMessage(
+          `Smarkets restricted this login (${limitedReason}). Limited mode enabled for public market scanning.`
+        )
+        setLoginVerifiedAt(new Date().toISOString())
+        setVerifiedAccountId(null)
+        setVerifiedAccountCurrency(null)
+        setError('')
+        setTimeout(() => setLoginExpanded(false), 800)
+        return
+      }
       setLoginStatus('invalid')
       setLoginStatusMessage(`Could not verify login: ${detail}`)
       setError(`Smarkets login failed: ${detail}`)
@@ -414,6 +498,23 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
     setTimeout(() => setUsed(null), 2000)
   }
 
+  const handleUseManualOdds = () => {
+    const back = parseFloat(manualBackOdds)
+    const lay = parseFloat(manualLayOdds)
+    if (!Number.isFinite(back) || back < 1.01 || !Number.isFinite(lay) || lay < 1.01) {
+      setError('Enter valid manual back/lay odds (minimum 1.01).')
+      return
+    }
+    onUse?.({
+      backOdds: back.toString(),
+      layOdds: lay.toString(),
+      label: manualLabel.trim() || 'Manual selection',
+    })
+    setError('')
+    setUsed('manual')
+    setTimeout(() => setUsed(null), 2000)
+  }
+
   const getFiltered = () => {
     if (filterMode === 'custom') {
       const min = parseFloat(customMin) || 1.01
@@ -426,9 +527,9 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
   }
 
   const filteredResults = getFiltered()
-  // For auto mode: qualifying sorted by spread, free bets by highest odds
-  const qualifying = results.filter(s => s.backOdds <= 3.0).sort((a, b) => a.spread - b.spread)
-  const freeBets   = results.filter(s => s.backOdds >= 5.0).sort((a, b) => b.backOdds - a.backOdds)
+  // For auto mode: both buckets sorted by efficiency (backOdds / layOdds) descending — most profitable first
+  const qualifying = results.filter(s => s.backOdds <= 3.0).sort((a, b) => (b.backOdds / b.layOdds) - (a.backOdds / a.layOdds))
+  const freeBets   = results.filter(s => s.backOdds >= 5.0).sort((a, b) => (b.backOdds / b.layOdds) - (a.backOdds / a.layOdds))
 
   const filterColor: Record<FilterMode, string> = {
     auto: 'var(--accent)', qualifying: 'var(--profit)', free_bet: 'var(--accent)', custom: 'var(--text)',
@@ -441,7 +542,7 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
     ? scanMode === 'all' ? `Scanning ${SPORTS.length} sports in parallel…` : 'Scanning…'
     : results.length > 0
       ? `${results.length} selections · ${qualifying.length} qualifying · ${freeBets.length} free bet${lastUpdatedAt ? ` · updated ${formatTime(lastUpdatedAt)}` : ''}`
-      : loginStatus === 'valid'
+      : loginStatus === 'valid' || loginStatus === 'limited'
         ? 'Ready — hit Scan to fetch live exchange odds'
         : 'Verify your Smarkets login above to start scanning'
 
@@ -452,20 +553,68 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
       <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: '20px' }}>
         <div className="label" style={{ marginBottom: '14px' }}>Live Odds Scanner — Smarkets Exchange</div>
 
+        <div style={{
+          marginBottom: '14px',
+          padding: '10px 12px',
+          borderRadius: 'var(--radius)',
+          border: '1px solid var(--border)',
+          background: 'var(--surface2)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
+            <div style={{ fontSize: '12px', color: 'var(--muted)' }}>
+              Data Source
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const next = !useSmarketsApi
+                setUseSmarketsApi(next)
+                localStorage.setItem('matchlock_use_smarkets_api', String(next))
+                setError('')
+              }}
+              style={{
+                padding: '5px 12px',
+                borderRadius: '100px',
+                fontSize: '12px',
+                border: useSmarketsApi ? '1px solid var(--accent)' : '1px solid var(--warning)',
+                background: useSmarketsApi ? 'var(--accent-dim)' : 'var(--warning-dim)',
+                color: useSmarketsApi ? 'var(--accent)' : 'var(--warning)',
+                cursor: 'pointer',
+                fontWeight: 600,
+              }}
+            >
+              {useSmarketsApi ? 'Smarkets API: On' : 'Smarkets API: Off'}
+            </button>
+          </div>
+          {!useSmarketsApi && (
+            <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '8px' }}>
+              API scanning is disabled. You can still add manual odds below and send them to the calculator.
+            </div>
+          )}
+        </div>
+
         {/* ── Smarkets login ── */}
-        {loginStatus === 'valid' && !loginExpanded ? (
+        {useSmarketsApi && (loginStatus === 'valid' || loginStatus === 'limited') && !loginExpanded ? (
           /* Compact verified bar */
           <div style={{
             marginBottom: '14px', padding: '9px 12px',
             borderRadius: 'var(--radius)',
-            border: '1px solid oklch(0.64 0.160 145 / 0.35)',
-            background: 'var(--profit-dim)',
+            border: loginStatus === 'limited'
+              ? '1px solid oklch(0.75 0.13 85 / 0.35)'
+              : '1px solid oklch(0.64 0.160 145 / 0.35)',
+            background: loginStatus === 'limited' ? 'var(--warning-dim)' : 'var(--profit-dim)',
             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: 'var(--profit)', flexShrink: 0 }} />
-              <span style={{ fontSize: '12px', color: 'var(--profit)', fontWeight: 500 }}>
-                Smarkets verified
+              <div style={{
+                width: '7px',
+                height: '7px',
+                borderRadius: '50%',
+                background: loginStatus === 'limited' ? 'var(--warning)' : 'var(--profit)',
+                flexShrink: 0,
+              }} />
+              <span style={{ fontSize: '12px', color: loginStatus === 'limited' ? 'var(--warning)' : 'var(--profit)', fontWeight: 500 }}>
+                {loginStatus === 'limited' ? 'Smarkets limited mode' : 'Smarkets verified'}
               </span>
               {loginVerifiedAt && (
                 <span style={{ fontSize: '11px', color: 'var(--muted)' }}>· {formatTime(loginVerifiedAt)}</span>
@@ -476,11 +625,13 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
               cursor: 'pointer', padding: '2px 6px',
             }}>Change</button>
           </div>
-        ) : (
+        ) : useSmarketsApi ? (
           <div style={{
             marginBottom: '14px', padding: '12px', borderRadius: 'var(--radius)',
             border: loginStatus === 'valid'
               ? '1px solid oklch(0.64 0.160 145 / 0.35)'
+              : loginStatus === 'limited'
+                ? '1px solid oklch(0.75 0.13 85 / 0.35)'
               : loginStatus === 'invalid'
                 ? '1px solid oklch(0.61 0.190 22 / 0.35)'
                 : '1px solid var(--border)',
@@ -488,13 +639,13 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
               <div className="label">Smarkets Login</div>
-              {loginStatus === 'valid' && (
+              {(loginStatus === 'valid' || loginStatus === 'limited') && (
                 <button onClick={() => setLoginExpanded(false)} style={{
                   fontSize: '11px', color: 'var(--muted)', background: 'transparent', border: 'none', cursor: 'pointer',
                 }}>Collapse ↑</button>
               )}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr auto', gap: '8px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr minmax(0, 1fr) auto', gap: '8px' }}>
               <input
                 value={smarketsEmail}
                 onChange={e => {
@@ -511,23 +662,47 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
                 className="input-field"
                 autoComplete="username"
               />
-              <input
-                type="password"
-                value={smarketsPassword}
-                onChange={e => {
-                  setSmarketsPassword(e.target.value)
-                if (loginStatus !== 'idle') {
-                  setLoginStatus('idle')
-                  setLoginStatusMessage('')
-                  setLoginVerifiedAt(null)
-                  setVerifiedAccountId(null)
-                  setVerifiedAccountCurrency(null)
-                }
-                }}
-                placeholder="Password"
-                className="input-field"
-                autoComplete="current-password"
-              />
+              <div style={{ position: 'relative', minWidth: 0 }}>
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={smarketsPassword}
+                  onChange={e => {
+                    setSmarketsPassword(e.target.value)
+                  if (loginStatus !== 'idle') {
+                    setLoginStatus('idle')
+                    setLoginStatusMessage('')
+                    setLoginVerifiedAt(null)
+                    setVerifiedAccountId(null)
+                    setVerifiedAccountCurrency(null)
+                  }
+                  }}
+                  placeholder="Password"
+                  className="input-field"
+                  autoComplete="current-password"
+                  style={{ paddingRight: '52px' }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(prev => !prev)}
+                  style={{
+                    position: 'absolute',
+                    right: '8px',
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--muted)',
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    padding: 0,
+                    lineHeight: 1,
+                  }}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showPassword ? 'Hide' : 'Show'}
+                </button>
+              </div>
               <button
                 onClick={handleVerifyAndSaveCredentials}
                 disabled={loginStatus === 'checking'}
@@ -540,12 +715,20 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
             <div style={{ fontSize: '11px', color: 'var(--subtle)', marginTop: '6px' }}>
               Stored only in your browser. Used to authenticate with Smarkets API.
             </div>
-            {(loginStatus === 'valid' || loginStatus === 'invalid') && (
+            {(loginStatus === 'valid' || loginStatus === 'limited' || loginStatus === 'invalid') && (
               <div style={{
                 marginTop: '8px', padding: '8px 10px', borderRadius: 'var(--radius)', fontSize: '12px',
-                border: loginStatus === 'valid' ? '1px solid oklch(0.64 0.160 145 / 0.35)' : '1px solid oklch(0.61 0.190 22 / 0.35)',
-                background: loginStatus === 'valid' ? 'var(--profit-dim)' : 'var(--danger-dim)',
-                color: loginStatus === 'valid' ? 'var(--profit)' : 'var(--danger)',
+                border: loginStatus === 'valid'
+                  ? '1px solid oklch(0.64 0.160 145 / 0.35)'
+                  : loginStatus === 'limited'
+                    ? '1px solid oklch(0.75 0.13 85 / 0.35)'
+                    : '1px solid oklch(0.61 0.190 22 / 0.35)',
+                background: loginStatus === 'valid'
+                  ? 'var(--profit-dim)'
+                  : loginStatus === 'limited'
+                    ? 'var(--warning-dim)'
+                    : 'var(--danger-dim)',
+                color: loginStatus === 'valid' ? 'var(--profit)' : loginStatus === 'limited' ? 'var(--warning)' : 'var(--danger)',
               }}>
                 <div>{loginStatusMessage}</div>
                 {loginStatus === 'valid' && verifiedAccountId && (
@@ -557,7 +740,7 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
               </div>
             )}
           </div>
-        )}
+        ) : null}
 
         {/* Scan mode toggle */}
         <div style={{ display: 'flex', gap: '6px', marginBottom: '14px' }}>
@@ -611,6 +794,37 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
           </div>
         )}
 
+        {/* Timeframe picker */}
+        <div style={{ marginBottom: '14px' }}>
+          <div className="label" style={{ marginBottom: '8px' }}>Timeframe</div>
+          <div style={{ display: 'flex', gap: '5px', flexWrap: isMobile ? 'nowrap' : 'wrap' }}>
+            {([
+              { id: 'any'      as Timeframe, label: 'Any time'  },
+              { id: '3h'       as Timeframe, label: 'Next 3h'   },
+              { id: 'today'    as Timeframe, label: 'Today'     },
+              { id: 'tomorrow' as Timeframe, label: 'Tomorrow'  },
+              { id: '7d'       as Timeframe, label: 'Next 7d'   },
+            ]).map(tf => {
+              const active = timeframe === tf.id
+              return (
+                <button
+                  key={tf.id}
+                  onClick={() => setTimeframe(tf.id)}
+                  style={{
+                    padding: '5px 13px', borderRadius: '100px', fontSize: '12px', cursor: 'pointer', flexShrink: 0,
+                    border: active ? '1px solid var(--accent)' : '1px solid var(--border)',
+                    background: active ? 'var(--accent-dim)' : 'transparent',
+                    color: active ? 'var(--accent)' : 'var(--muted)',
+                    fontWeight: active ? 600 : 400, transition: 'all 0.12s',
+                  }}
+                >
+                  {tf.label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
         {/* Search + scan row */}
         <div style={{ display: 'flex', gap: '10px' }}>
           <input
@@ -618,18 +832,59 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
             onKeyDown={e => e.key === 'Enter' && !loading && scan()}
             placeholder={isMobile ? 'Filter event name (optional)' : scanMode === 'all' ? 'Filter by team / event name across all sports (optional)' : 'Filter by team / event name (optional)'}
             className="input-field" style={{ flex: 1 }}
+            disabled={!useSmarketsApi}
           />
-          <button onClick={scan} disabled={loading || loginStatus !== 'valid' || !verifiedAccountId} className="btn-primary" style={{
+          <button onClick={scan} disabled={!useSmarketsApi || loading || (loginStatus !== 'valid' && loginStatus !== 'limited')} className="btn-primary" style={{
             minWidth: isMobile ? '80px' : '130px',
-            opacity: (loading || loginStatus !== 'valid' || !verifiedAccountId) ? 0.6 : 1,
-            cursor: (loading || loginStatus !== 'valid' || !verifiedAccountId) ? 'not-allowed' : 'pointer',
+            opacity: (!useSmarketsApi || loading || (loginStatus !== 'valid' && loginStatus !== 'limited')) ? 0.6 : 1,
+            cursor: (!useSmarketsApi || loading || (loginStatus !== 'valid' && loginStatus !== 'limited')) ? 'not-allowed' : 'pointer',
           }}>
             {loading ? '…' : scanMode === 'all' ? (isMobile ? 'Scan' : 'Scan All') : 'Scan'}
           </button>
         </div>
-        {(loginStatus !== 'valid' || !verifiedAccountId) && (
+        {useSmarketsApi && loginStatus !== 'valid' && loginStatus !== 'limited' && (
           <div style={{ fontSize: '11px', color: 'var(--warning)', marginTop: '6px' }}>
             Verify your Smarkets login to enable scanning.
+          </div>
+        )}
+
+        {!useSmarketsApi && (
+          <div style={{ marginTop: '14px', paddingTop: '14px', borderTop: '1px solid var(--border)' }}>
+            <div className="label" style={{ marginBottom: '8px' }}>Manual Odds Entry</div>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 110px 110px auto', gap: '8px' }}>
+              <input
+                value={manualLabel}
+                onChange={e => setManualLabel(e.target.value)}
+                placeholder="Selection label (optional)"
+                className="input-field"
+              />
+              <input
+                type="number"
+                step="0.01"
+                min="1.01"
+                value={manualBackOdds}
+                onChange={e => setManualBackOdds(e.target.value)}
+                placeholder="Back"
+                className="input-field"
+              />
+              <input
+                type="number"
+                step="0.01"
+                min="1.01"
+                value={manualLayOdds}
+                onChange={e => setManualLayOdds(e.target.value)}
+                placeholder="Lay"
+                className="input-field"
+              />
+              <button
+                type="button"
+                onClick={handleUseManualOdds}
+                className="btn-primary"
+                style={{ minWidth: '130px' }}
+              >
+                {used === 'manual' ? '✓ Sent' : 'Use in Calculator'}
+              </button>
+            </div>
           </div>
         )}
 
@@ -733,24 +988,24 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
         <div className="bucket-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
           <Bucket
             title="Qualifying Bets"
-            subtitle="Under 3.0 — tightest spread, smallest qualifying loss"
+            subtitle="Under 3.0 — least qualifying loss first"
             accentColor="var(--profit)"
             dimColor="var(--profit-dim)"
             selections={qualifying}
             used={used}
             onUse={handleUse}
-            sortLabel="sorted by spread"
+            sortLabel="by profit ↓"
             bookmaker={bookmaker}
           />
           <Bucket
-            title="Free Bets — Highest Odds"
+            title="Free Bets — Best Value"
             subtitle="5.0+ — max cash extraction from free bet (SNR)"
             accentColor="var(--accent)"
             dimColor="var(--accent-dim)"
             selections={freeBets}
             used={used}
             onUse={handleUse}
-            sortLabel="sorted by odds ↓"
+            sortLabel="by profit ↓"
             bookmaker={bookmaker}
           />
         </div>
@@ -855,6 +1110,12 @@ function Bucket({ title, subtitle, accentColor, dimColor, selections, used, onUs
                 <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '1px' }}>
                   lay {sel.layOdds.toFixed(2)} · sp {sel.spread.toFixed(2)}
                 </div>
+                <div style={{
+                  fontSize: '10px', fontWeight: 700, marginTop: '2px',
+                  color: sel.backOdds >= sel.layOdds ? 'var(--profit)' : 'var(--warning)',
+                }}>
+                  {((sel.backOdds / sel.layOdds - 1) * 100).toFixed(1)}% eff
+                </div>
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flexShrink: 0 }}>
@@ -906,7 +1167,7 @@ function ResultsList({ selections, accentColor, used, onUse, bookmaker }: {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
       <div style={{
-        display: 'grid', gridTemplateColumns: '28px 1fr 76px 64px 54px 60px auto auto',
+        display: 'grid', gridTemplateColumns: '28px 1fr 76px 64px 54px 56px 60px auto auto',
         gap: '12px', padding: '6px 14px',
         fontSize: '10px', color: 'var(--subtle)', textTransform: 'uppercase', letterSpacing: '0.5px',
       }}>
@@ -914,6 +1175,7 @@ function ResultsList({ selections, accentColor, used, onUse, bookmaker }: {
         <span style={{ textAlign: 'right' }}>Back</span>
         <span style={{ textAlign: 'right' }}>Lay</span>
         <span style={{ textAlign: 'center' }}>Spread</span>
+        <span style={{ textAlign: 'center' }}>Eff %</span>
         <span>Sport</span>
         <span /><span />
       </div>
@@ -925,7 +1187,7 @@ function ResultsList({ selections, accentColor, used, onUse, bookmaker }: {
           <div key={sel.contractId} style={{
             background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
             padding: '11px 14px',
-            display: 'grid', gridTemplateColumns: '28px 1fr 76px 64px 54px 60px auto auto',
+            display: 'grid', gridTemplateColumns: '28px 1fr 76px 64px 54px 56px 60px auto auto',
             gap: '12px', alignItems: 'center',
           }}>
             <div style={{
@@ -959,6 +1221,17 @@ function ResultsList({ selections, accentColor, used, onUse, bookmaker }: {
                 color: spreadGood ? 'var(--profit)' : spreadOk ? 'var(--warning)' : 'var(--danger)',
                 background: spreadGood ? 'var(--profit-dim)' : spreadOk ? 'var(--warning-dim)' : 'var(--danger-dim)',
               }}>{sel.spread.toFixed(2)}</span>
+            </div>
+
+            <div style={{ textAlign: 'center' }}>
+              <span style={{
+                display: 'inline-block', fontSize: '11px', fontWeight: 700,
+                padding: '2px 6px', borderRadius: '4px', fontVariantNumeric: 'tabular-nums',
+                color: sel.backOdds >= sel.layOdds ? 'var(--profit)' : 'var(--warning)',
+                background: sel.backOdds >= sel.layOdds ? 'var(--profit-dim)' : 'var(--warning-dim)',
+              }}>
+                {((sel.backOdds / sel.layOdds - 1) * 100).toFixed(1)}%
+              </span>
             </div>
 
             <SportBadge sport={sel.sport} />

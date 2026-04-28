@@ -34,26 +34,17 @@ The app is working end to end locally:
 
 ```bash
 npm install
-cp .env.example .env.local
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
 
-## Environment Variables
+## Authentication Model
 
-Create `.env.local` from `.env.example` and provide:
-
-```bash
-SMARKETS_USERNAME=your-email@example.com
-SMARKETS_PASSWORD=your-password
-```
-
-Notes:
-
-- Credentials are read server-side only by the API route.
-- Do not commit `.env.local`.
-- If credentials are missing, Smarkets requests run unauthenticated and may be limited.
+- Each user enters their own Smarkets email/password in the Odds Scanner tab.
+- Credentials are sent to the app's server-side proxy per request and are not shared across users.
+- No Vercel project-level Smarkets credentials are required for multi-user usage.
+- The UI stores credentials in browser storage for convenience on that device.
 
 ## Data Storage
 
