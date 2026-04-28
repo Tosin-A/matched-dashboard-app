@@ -10,6 +10,9 @@ const LOGIN_RATE_LIMIT_MAX_REQUESTS = 10
 type LoginResponse = {
   token?: string
   error_type?: string
+  factor?: string
+  verify?: boolean
+  redirect_url?: string
 }
 
 type Credentials = {
@@ -117,33 +120,64 @@ async function fetchSessionToken(creds: Credentials, forceRefresh = false): Prom
     return cached.token
   }
 
-  const loginPayload: Record<string, unknown> = {
-    create_social_member: true,
-    username: creds.username,
-    password: creds.password,
-    remember: true,
-    reopen_account: false,
-    use_auth_v2: false,
+  const loginPayloads: Record<string, unknown>[] = [
+    {
+      // Docs-first payload.
+      create_social_member: true,
+      username: creds.username,
+      password: creds.password,
+      remember: true,
+      reopen_account: false,
+      use_auth_v2: false,
+    },
+    {
+      // Some accounts reject social-member creation attempts.
+      create_social_member: false,
+      username: creds.username,
+      password: creds.password,
+      remember: true,
+      reopen_account: false,
+      use_auth_v2: false,
+    },
+    {
+      // Legacy-compatible minimal payload used by some older Smarkets auth setups.
+      username: creds.username,
+      password: creds.password,
+      remember: true,
+    },
+  ]
+
+  let finalReason = 'HTTP 500'
+  for (const payload of loginPayloads) {
+    assertSessionLoginRateLimit()
+    const loginResult = await loginWithPayload(payload)
+    if (loginResult.ok && loginResult.token) {
+      tokenCache.set(cacheKey, {
+        token: loginResult.token,
+        expiryMs: now + SESSION_TOKEN_TTL_MS - SESSION_TOKEN_RENEW_BUFFER_MS,
+        accountId: null,
+      })
+      return loginResult.token
+    }
+    if (loginResult.ok && !loginResult.token && (loginResult.verify || loginResult.factor)) {
+      throw new Error(
+        `Smarkets login requires additional verification (factor=${loginResult.factor ?? 'required'}). Complete verification in Smarkets and retry.`
+      )
+    }
+
+    finalReason = loginResult.error_type || `HTTP ${loginResult.status}`
+    if (finalReason !== 'REQUEST_VALIDATION_ERROR') {
+      // Auth failures and policy blocks won't be fixed by more schema variants.
+      break
+    }
   }
 
-  assertSessionLoginRateLimit()
-  const loginResult = await loginWithPayload(loginPayload)
-  if (loginResult.ok && loginResult.token) {
-    tokenCache.set(cacheKey, {
-      token: loginResult.token,
-      expiryMs: now + SESSION_TOKEN_TTL_MS - SESSION_TOKEN_RENEW_BUFFER_MS,
-      accountId: null,
-    })
-    return loginResult.token
-  }
-
-  const reason = loginResult.error_type || `HTTP ${loginResult.status}`
-  if (reason === 'INVALID_CREDENTIALS') {
+  if (finalReason === 'INVALID_CREDENTIALS') {
     throw new Error(
       'Smarkets login failed: INVALID_CREDENTIALS (double-check credentials and confirm your account has API access enabled).'
     )
   }
-  throw new Error(`Smarkets login failed: ${reason}`)
+  throw new Error(`Smarkets login failed: ${finalReason}`)
 }
 
 async function fetchAccountIdForToken(token: string): Promise<string | null> {

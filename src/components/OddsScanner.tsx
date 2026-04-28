@@ -444,7 +444,9 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
     }
 
     setLoginStatus('checking')
-    setLoginStatusMessage('Checking your Smarkets login…')
+    setLoginStatusMessage(
+      'Checking your Smarkets login… If Smarkets emails you, approve the sign-in request (it may appear as coming from the US).'
+    )
     setLoginVerifiedAt(null)
     setVerifiedAccountId(null)
     setVerifiedAccountCurrency(null)
@@ -714,6 +716,10 @@ export default function OddsScanner({ onUse }: { onUse?: OnUse }) {
             </div>
             <div style={{ fontSize: '11px', color: 'var(--subtle)', marginTop: '6px' }}>
               Stored only in your browser. Used to authenticate with Smarkets API.
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--warning)', marginTop: '6px' }}>
+              If Smarkets sends a security email after you enter details or click Verify, check your inbox and approve the
+              request. It may show as originating from the app/US location.
             </div>
             {(loginStatus === 'valid' || loginStatus === 'limited' || loginStatus === 'invalid') && (
               <div style={{
