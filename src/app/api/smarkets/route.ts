@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const BASE = 'https://api.smarkets.com/v3'
 const LOGIN_URL = `${BASE}/sessions/`
+const SESSION_TOKEN_TTL_MS = 30 * 60 * 1000
+const SESSION_TOKEN_RENEW_BUFFER_MS = 60 * 1000
+const LOGIN_RATE_LIMIT_WINDOW_MS = 60 * 1000
+const LOGIN_RATE_LIMIT_MAX_REQUESTS = 10
 
 type LoginResponse = {
   token?: string
@@ -32,6 +36,7 @@ type CachedSession = {
 }
 
 const tokenCache = new Map<string, CachedSession>()
+const loginAttemptTimestamps: number[] = []
 
 function getRequestCredentials(req: NextRequest): Credentials | null {
   const username = req.headers.get('x-smarkets-username')?.trim()
@@ -78,6 +83,31 @@ async function loginWithPayload(payload: Record<string, unknown>): Promise<Login
   }
 }
 
+function trimOldLoginAttempts(now: number): void {
+  while (loginAttemptTimestamps.length > 0 && now - loginAttemptTimestamps[0] >= LOGIN_RATE_LIMIT_WINDOW_MS) {
+    loginAttemptTimestamps.shift()
+  }
+}
+
+function assertSessionLoginRateLimit(): void {
+  const now = Date.now()
+  trimOldLoginAttempts(now)
+  if (loginAttemptTimestamps.length >= LOGIN_RATE_LIMIT_MAX_REQUESTS) {
+    throw new Error('RATE_LIMIT_EXCEEDED: Session login limit is 10 requests per 60 seconds.')
+  }
+  loginAttemptTimestamps.push(now)
+}
+
+function renewCachedSessionExpiry(creds: Credentials): void {
+  const cacheKey = makeCacheKey(creds)
+  const cached = tokenCache.get(cacheKey)
+  if (!cached) return
+  tokenCache.set(cacheKey, {
+    ...cached,
+    expiryMs: Date.now() + SESSION_TOKEN_TTL_MS - SESSION_TOKEN_RENEW_BUFFER_MS,
+  })
+}
+
 async function fetchSessionToken(creds: Credentials, forceRefresh = false): Promise<string> {
   const cacheKey = makeCacheKey(creds)
 
@@ -87,63 +117,33 @@ async function fetchSessionToken(creds: Credentials, forceRefresh = false): Prom
     return cached.token
   }
 
-  const loginPayloads: Record<string, unknown>[] = [
-    {
-      username: creds.username,
-      password: creds.password,
-      remember: true,
-      create_social_member: false,
-      reopen_account: false,
-      use_auth_v2: false,
-    },
-    {
-      username: creds.username,
-      password: creds.password,
-      remember: true,
-    },
-    {
-      username: creds.username,
-      password: creds.password,
-      use_auth_v2: true,
-    },
-  ]
-
-  let lastReason = 'HTTP 500'
-  for (let i = 0; i < loginPayloads.length; i++) {
-    const payload = loginPayloads[i]
-    const loginResult = await loginWithPayload(payload)
-    if (loginResult.ok && loginResult.token) {
-      // API docs: token validity is 30 minutes and renewed on use.
-      tokenCache.set(cacheKey, {
-        token: loginResult.token,
-        expiryMs: now + 29 * 60 * 1000,
-        accountId: null,
-      })
-      return loginResult.token
-    }
-    lastReason = loginResult.error_type || `HTTP ${loginResult.status}`
-
-    // Most auth failures won't be fixed by trying alternate payload variants.
-    // Keep retries for schema/format problems only to avoid hitting rate limits.
-    const shouldTryAnotherPayload =
-      i < loginPayloads.length - 1 &&
-      (lastReason === 'REQUEST_VALIDATION_ERROR' || lastReason.startsWith('HTTP 5'))
-    if (!shouldTryAnotherPayload) {
-      break
-    }
-
-    if (lastReason === 'RATE_LIMIT_EXCEEDED') {
-      // Avoid rapid repeat login attempts when Smarkets is actively rate-limiting.
-      break
-    }
+  const loginPayload: Record<string, unknown> = {
+    create_social_member: true,
+    username: creds.username,
+    password: creds.password,
+    remember: true,
+    reopen_account: false,
+    use_auth_v2: false,
   }
 
-  if (lastReason === 'INVALID_CREDENTIALS') {
+  assertSessionLoginRateLimit()
+  const loginResult = await loginWithPayload(loginPayload)
+  if (loginResult.ok && loginResult.token) {
+    tokenCache.set(cacheKey, {
+      token: loginResult.token,
+      expiryMs: now + SESSION_TOKEN_TTL_MS - SESSION_TOKEN_RENEW_BUFFER_MS,
+      accountId: null,
+    })
+    return loginResult.token
+  }
+
+  const reason = loginResult.error_type || `HTTP ${loginResult.status}`
+  if (reason === 'INVALID_CREDENTIALS') {
     throw new Error(
       'Smarkets login failed: INVALID_CREDENTIALS (double-check credentials and confirm your account has API access enabled).'
     )
   }
-  throw new Error(`Smarkets login failed: ${lastReason}`)
+  throw new Error(`Smarkets login failed: ${reason}`)
 }
 
 async function fetchAccountIdForToken(token: string): Promise<string | null> {
@@ -188,16 +188,26 @@ async function fetchSmarketsJson(path: string, query: URLSearchParams, creds: Cr
 
   if (isQuotesRequest) {
     // Quotes change constantly, so bypass caching to keep scanner prices accurate.
-    return fetch(url, {
+    const res = await fetch(url, {
       headers,
       cache: 'no-store',
     })
+    if (res.ok) {
+      // Smarkets renews active session tokens on authenticated use.
+      renewCachedSessionExpiry(creds)
+    }
+    return res
   }
 
-  return fetch(url, {
+  const res = await fetch(url, {
     headers,
     next: { revalidate: 30 },
   })
+  if (res.ok) {
+    // Smarkets renews active session tokens on authenticated use.
+    renewCachedSessionExpiry(creds)
+  }
+  return res
 }
 
 async function fetchSmarketsPublicJson(path: string, query: URLSearchParams) {
